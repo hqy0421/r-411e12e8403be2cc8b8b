@@ -7,6 +7,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -22,6 +23,11 @@ import technology.tabula.detectors.DetectionAlgorithm;
 import technology.tabula.detectors.NurminenDetectionAlgorithm;
 import technology.tabula.extractors.BasicExtractionAlgorithm;
 import technology.tabula.extractors.SpreadsheetExtractionAlgorithm;
+import technology.tabula.form.AcroFormExtractor;
+import technology.tabula.form.FormConfig;
+import technology.tabula.form.FormExtractionException;
+import technology.tabula.form.FormFieldMapping;
+import technology.tabula.form.FormJsonWriter;
 import technology.tabula.writers.CSVWriter;
 import technology.tabula.writers.JSONWriter;
 import technology.tabula.writers.TSVWriter;
@@ -45,6 +51,8 @@ public class CommandLineApp {
     private OutputFormat outputFormat;
     private String password;
     private TableExtractor tableExtractor;
+    private List<FormFieldMapping> formMappings;
+    private File formOutputFile;
 
     public CommandLineApp(Appendable defaultOutput, CommandLine line) throws ParseException {
         this.defaultOutput = defaultOutput;
@@ -52,6 +60,8 @@ public class CommandLineApp {
         this.pages = CommandLineApp.whichPages(line);
         this.outputFormat = CommandLineApp.whichOutputFormat(line);
         this.tableExtractor = CommandLineApp.createExtractor(line);
+        this.formMappings = CommandLineApp.whichFormMappings(line);
+        this.formOutputFile = CommandLineApp.whichFormOutputFile(line);
 
         if (line.hasOption('s')) {
             this.password = line.getOptionValue('s');
@@ -117,7 +127,11 @@ public class CommandLineApp {
         for (File pdfFile : pdfs) {
           File outputFile = new File(getOutputFilename(pdfFile));
           try {
-            extractFileInto(pdfFile, outputFile);
+            if (formMappings == null) {
+                extractFileInto(pdfFile, outputFile);
+            } else {
+                extractFileWithForm(pdfFile, outputFile, new File(getFormOutputFilename(pdfFile)));
+            }
           } catch (ParseException e) {
             System.err.println("Caught exception while processing file: " + pdfFile.toString());
             throw e;
@@ -126,13 +140,20 @@ public class CommandLineApp {
     }
 
     public void extractFileTables(CommandLine line, File pdfFile) throws ParseException {
-        if (!line.hasOption('o')) {
-            extractFile(pdfFile, this.defaultOutput);
+        if (formMappings == null) {
+            if (!line.hasOption('o')) {
+                extractFile(pdfFile, this.defaultOutput);
+                return;
+            }
+            extractFileInto(pdfFile, new File(line.getOptionValue('o')));
             return;
         }
 
-        File outputFile = new File(line.getOptionValue('o'));
-        extractFileInto(pdfFile, outputFile);
+        // Form extraction is enabled: tables and forms are written to
+        // independent targets. A null target means "write to stdout" for
+        // tables, or "derive a sibling file" for the form output.
+        File tableOutput = line.hasOption('o') ? new File(line.getOptionValue('o')) : null;
+        extractFileWithForm(pdfFile, tableOutput, this.formOutputFile);
     }
 
     public void extractFileInto(File pdfFile, File outputFile) throws ParseException {
@@ -159,45 +180,109 @@ public class CommandLineApp {
     private void extractFile(File pdfFile, Appendable outFile) throws ParseException {
         PDDocument pdfDocument = null;
         try {
-            pdfDocument = this.password == null ?  Loader.loadPDF(pdfFile) :  Loader.loadPDF(pdfFile,password);
-            PageIterator pageIterator = getPageIterator(pdfDocument);
-            List<Table> tables = new ArrayList<>();
-
-            while (pageIterator.hasNext()) {
-                Page page = pageIterator.next();
-
-                if (tableExtractor.verticalRulingPositions != null) {
-                    for (Float verticalRulingPosition : tableExtractor.verticalRulingPositions) {
-                        page.addRuling(new Ruling(0, verticalRulingPosition, 0.0f, (float) page.getHeight()));
-                    }
-                }
-
-                if (pageAreas != null) {
-                    for (Pair<Integer, Rectangle> areaPair : pageAreas) {
-                        Rectangle area = areaPair.getRight();
-                        if (areaPair.getLeft() == RELATIVE_AREA_CALCULATION_MODE) {
-                            area = new Rectangle((float) (area.getTop() / 100 * page.getHeight()),
-                                    (float) (area.getLeft() / 100 * page.getWidth()), (float) (area.getWidth() / 100 * page.getWidth()),
-                                    (float) (area.getHeight() / 100 * page.getHeight()));
-                        }
-                        tables.addAll(tableExtractor.extractTables(page.getArea(area)));
-                    }
-                } else {
-                    tables.addAll(tableExtractor.extractTables(page));
-                }
-            }
+            pdfDocument = loadDocument(pdfFile);
+            List<Table> tables = extractTablesFromDocument(pdfDocument);
             writeTables(tables, outFile);
         } catch (IOException e) {
             throw new ParseException(e.getMessage());
         } finally {
-            try {
-                if (pdfDocument != null) {
-                    pdfDocument.close();
+            closeQuietly(pdfDocument);
+        }
+    }
+
+    private void extractFileWithForm(File pdfFile, File tableOutputFile, File formOutputFile)
+            throws ParseException {
+        PDDocument pdfDocument = null;
+        try {
+            pdfDocument = loadDocument(pdfFile);
+            List<Table> tables = extractTablesFromDocument(pdfDocument);
+            Map<String, technology.tabula.form.FormFieldValue> formValues =
+                    new AcroFormExtractor(pdfDocument, this.pages).extract(this.formMappings);
+
+            if (tableOutputFile == null) {
+                writeTables(tables, this.defaultOutput);
+            } else {
+                writeToFile(tableOutputFile, out -> writeTables(tables, out));
+            }
+
+            File resolvedFormOutput = formOutputFile != null
+                    ? formOutputFile
+                    : new File(getFormOutputFilename(pdfFile));
+            writeToFile(resolvedFormOutput, out -> new FormJsonWriter().write(out, formValues));
+        } catch (IOException e) {
+            throw new ParseException(e.getMessage());
+        } catch (FormExtractionException e) {
+            throw new ParseException(e.getMessage());
+        } finally {
+            closeQuietly(pdfDocument);
+        }
+    }
+
+    private interface AppendableWriter {
+        void write(Appendable out) throws IOException;
+    }
+
+    private void writeToFile(File outputFile, AppendableWriter writer) throws ParseException {
+        BufferedWriter bufferedWriter = null;
+        try {
+            bufferedWriter = new BufferedWriter(new FileWriter(outputFile.getAbsoluteFile()));
+            outputFile.createNewFile();
+            writer.write(bufferedWriter);
+        } catch (IOException e) {
+            throw new ParseException("Cannot create file " + outputFile);
+        } finally {
+            if (bufferedWriter != null) {
+                try {
+                    bufferedWriter.close();
+                } catch (IOException e) {
+                    System.out.println("Error in closing the BufferedWriter" + e);
                 }
+            }
+        }
+    }
+
+    private PDDocument loadDocument(File pdfFile) throws IOException {
+        return this.password == null ? Loader.loadPDF(pdfFile) : Loader.loadPDF(pdfFile, password);
+    }
+
+    private static void closeQuietly(PDDocument pdfDocument) {
+        if (pdfDocument != null) {
+            try {
+                pdfDocument.close();
             } catch (IOException e) {
                 System.out.println("Error in closing pdf document" + e);
             }
         }
+    }
+
+    private List<Table> extractTablesFromDocument(PDDocument pdfDocument) throws IOException {
+        PageIterator pageIterator = getPageIterator(pdfDocument);
+        List<Table> tables = new ArrayList<>();
+
+        while (pageIterator.hasNext()) {
+            Page page = pageIterator.next();
+
+            if (tableExtractor.verticalRulingPositions != null) {
+                for (Float verticalRulingPosition : tableExtractor.verticalRulingPositions) {
+                    page.addRuling(new Ruling(0, verticalRulingPosition, 0.0f, (float) page.getHeight()));
+                }
+            }
+
+            if (pageAreas != null) {
+                for (Pair<Integer, Rectangle> areaPair : pageAreas) {
+                    Rectangle area = areaPair.getRight();
+                    if (areaPair.getLeft() == RELATIVE_AREA_CALCULATION_MODE) {
+                        area = new Rectangle((float) (area.getTop() / 100 * page.getHeight()),
+                                (float) (area.getLeft() / 100 * page.getWidth()), (float) (area.getWidth() / 100 * page.getWidth()),
+                                (float) (area.getHeight() / 100 * page.getHeight()));
+                    }
+                    tables.addAll(tableExtractor.extractTables(page.getArea(area)));
+                }
+            } else {
+                tables.addAll(tableExtractor.extractTables(page));
+            }
+        }
+        return tables;
     }
 
     private PageIterator getPageIterator(PDDocument pdfDocument) throws IOException {
@@ -251,6 +336,28 @@ public class CommandLineApp {
     private static List<Integer> whichPages(CommandLine line) throws ParseException {
         String pagesOption = line.hasOption('p') ? line.getOptionValue('p') : "1";
         return Utils.parsePagesOption(pagesOption);
+    }
+
+    private static List<FormFieldMapping> whichFormMappings(CommandLine line) throws ParseException {
+        if (!line.hasOption("form-config")) {
+            return null;
+        }
+        File configFile = new File(line.getOptionValue("form-config"));
+        if (!configFile.exists() || !configFile.isFile()) {
+            throw new ParseException("Form mapping configuration file does not exist: " + configFile);
+        }
+        try {
+            return FormConfig.parseFile(configFile);
+        } catch (FormExtractionException e) {
+            throw new ParseException(e.getMessage());
+        }
+    }
+
+    private static File whichFormOutputFile(CommandLine line) {
+        if (!line.hasOption("form-out")) {
+            return null;
+        }
+        return new File(line.getOptionValue("form-out"));
     }
 
     private static ExtractionMethod whichExtractionMethod(CommandLine line) {
@@ -363,6 +470,18 @@ public class CommandLineApp {
                 .desc("Comma separated list of ranges, or all. Examples: --pages 1-3,5-7, --pages 3 or --pages all. Default is --pages 1")
                 .hasArg()
                 .argName("PAGES")
+                .build());
+        o.addOption(Option.builder()
+                .longOpt("form-config")
+                .desc("Enable AcroForm extraction using the JSON field mapping in <FILE>. Each mapping gives a field's full path (\"path\" as an array of partial names or a dotted string), an output \"column\" and a \"type\" (text, checkbox or choice). Only fields with a widget on a page selected by --pages are read; table extraction is unchanged.")
+                .hasArg()
+                .argName("FILE")
+                .build());
+        o.addOption(Option.builder()
+                .longOpt("form-out")
+                .desc("Write extracted form values to <FILE>. Only used with --form-config. Defaults to a sibling <pdfname>.form.json file (or <pdfname>.form.json next to each PDF in --batch mode).")
+                .hasArg()
+                .argName("OUTFILE")
                 .build());
 
         return o;
@@ -489,6 +608,10 @@ public class CommandLineApp {
                 break;
         }
         return pdfFile.getPath().replaceFirst("(\\.pdf|)$", extension);
+    }
+
+    private String getFormOutputFilename(File pdfFile) {
+        return pdfFile.getPath().replaceFirst("(\\.pdf|)$", ".form.json");
     }
 
     private enum OutputFormat {

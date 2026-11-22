@@ -73,6 +73,65 @@ It also includes a debugging tool, run `java -cp ./target/tabula-1.0.5-jar-with-
 
 You can also integrate `tabula-java` with any JVM language. For Java examples, see the [`tests`](src/test/java/technology/tabula/) folder.
 
+## AcroForm field extraction
+
+Some fillable PDFs (AcroForms) hold values in form controls that are never
+drawn into the page text, so ordinary table extraction cannot see them.
+`tabula-java` can optionally extract those form values as JSON, independently
+of its table extraction.
+
+Enable it with `--form-config <FILE>`, pointing at a JSON mapping that pairs
+each field's **full path** with an output column and a value type:
+
+```json
+{
+  "fields": [
+    {"path": ["shipper", "name"], "column": "shipper_name", "type": "text"},
+    {"path": "consignee.name",    "column": "consignee_name", "type": "text"},
+    {"path": "hazard",            "column": "hazard", "type": "checkbox"},
+    {"path": "terms",             "column": "terms", "type": "choice"}
+  ]
+}
+```
+
+- `path` is the field's full path from the form root. It may be written as an
+  array of partial names or as a dotted string. Same-named fields under
+  different parents stay distinct because the full path differs.
+- `type` is one of `text`, `checkbox` or `choice` (case-insensitive).
+  Text fields produce JSON strings, check boxes booleans, and combo/list boxes
+  arrays of export values in storage order.
+- The same `--pages` selection used for tables applies: only fields that have
+  a widget annotation on a selected page are read. A field with several
+  widgets yields one value plus the deduplicated, sorted list of selected
+  pages carrying those widgets.
+- Missing values are `null`. An empty text field stays `""`, an unchecked box
+  stays `false`, and a choice with nothing selected stays `[]`.
+- A full path that resolves to more than one field, or a type that does not
+  match the field, aborts the run with an explicit error. Push buttons, radio
+  buttons and signature fields are not supported.
+
+The form result is always written to a file. Use `--form-out <FILE>` to set
+it, otherwise a sibling `<pdfname>.form.json` is created (in `--batch` mode
+each PDF gets one). Table extraction is unchanged and keeps using `--format`,
+`--outfile` and stdout:
+
+```
+$ java -jar tabula.jar customs.pdf --form-config mapping.json --form-out forms.json -p all
+```
+
+Each output column maps to an object with the extracted `value` and its
+`pages`:
+
+```json
+{
+  "shipper_name": {"value": "Globex Trading", "pages": [1]},
+  "hazard":       {"value": false, "pages": [2]},
+  "terms":        {"value": ["DDP", "FOB"], "pages": [1]},
+  "unmapped":     {"value": null, "pages": []}
+}
+```
+
+
 JVM start-up time is a lot of the cost of the `tabula` command, so if you're trying to extract many tables from PDFs, you have a few options for speeding it up:
 
  - the -b option, which allows you to convert all pdfs in a given directory
